@@ -10,6 +10,13 @@ product, then tweak it.
 
 ## Run it
 
+> **Credentials are committed.** `.env` holds this project's Supabase URL, service-role key and database
+> connection string (the repo is private and this was a deliberate choice). So `npm start` talks to the **live
+> Supabase project** by default. For a throwaway local run, create `.env.local` containing `DATABASE_URL=` and
+> `SUPABASE_URL=` (empty values) to fall back to local SQLite and disk. Anyone with read access to the repo has
+> full access to the project, so keep the repo private; if the repo ever becomes public or is shared more widely,
+> rotate both secrets first.
+
 ```bash
 npm install
 cp .env.example .env      # set ADMIN_PASSWORD
