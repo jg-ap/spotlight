@@ -10,10 +10,12 @@
   "scripts": {
     "start": "node --env-file-if-exists=.env server.js",
     "dev": "node --watch --env-file-if-exists=.env server.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "test:pg": "DATABASE_URL=$TEST_DATABASE_URL node --test test/*.test.js"
   },
   "dependencies": {
     "express": "^4.22.3",
-    "multer": "^2.5.0"
+    "multer": "^2.5.0",
+    "pg": "^8.23.1"
   }
 }

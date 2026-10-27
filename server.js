@@ -40,6 +40,9 @@ const CSP = [
   "base-uri 'none'", "form-action 'self'", "frame-ancestors 'self'",
 ].join('; ');
 
+// Express 4 doesn't catch rejected promises from async handlers, so route them to the error handler.
+const ah = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
 function createApp({ seed = true } = {}) {
   const app = express();
   const store = storage.create();
@@ -56,32 +59,33 @@ function createApp({ seed = true } = {}) {
     next();
   });
   app.use(express.json({ limit: '2mb' }));
+  // Nothing is served until the database is reachable and migrated.
+  app.use((req, res, next) => db.ready.then(() => next(), next));
 
   // ---- static ----
   app.use('/assets', express.static(path.join(config.root, 'public'), { maxAge: config.production ? '1h' : 0 }));
   app.use('/admin', (req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next(); },
     express.static(path.join(config.root, 'admin'), { index: 'index.html' }));
   if (store.dir) app.use('/uploads', express.static(store.dir, { maxAge: '30d', immutable: true, index: false, dotfiles: 'deny' }));
-  app.get('/healthz', (req, res) => res.json({ ok: true, storage: store.name }));
+  app.get('/healthz', (req, res) => res.json({ ok: true, storage: store.name, database: db.kind }));
 
   // ---- public pages ----
-  app.get('/', (req, res) => {
-    const pages = db.listPages().filter(p => p.status === 'published').map(p => ({ ...p, description: db.getPage(p.id).doc.meta.description }));
-    res.type('html').send(renderIndex(pages));
-  });
-  app.get('/p/:slug', (req, res) => {
-    const page = db.getPageBySlug(req.params.slug);
+  app.get('/', ah(async (req, res) => {
+    res.type('html').send(renderIndex((await db.listPages()).filter(p => p.status === 'published')));
+  }));
+  app.get('/p/:slug', ah(async (req, res) => {
+    const page = await db.getPageBySlug(req.params.slug);
     if (!page || (page.status !== 'published' && !auth.isAdmin(req))) return res.status(404).type('html').send(notFound());
     res.setHeader('Cache-Control', 'no-cache');
-    res.type('html').send(renderPage(page, { altMap: db.altMap() }));
-  });
-  app.get('/preview/:id', (req, res) => {
+    res.type('html').send(renderPage(page, { altMap: await db.altMap() }));
+  }));
+  app.get('/preview/:id', ah(async (req, res) => {
     if (!auth.isAdmin(req)) return res.status(401).send('Sign in to the admin first.');
-    const page = db.getPage(req.params.id);
+    const page = await db.getPage(req.params.id);
     if (!page) return res.status(404).send('Not found');
     res.setHeader('Cache-Control', 'no-store');
-    res.type('html').send(renderPage(page, { preview: true, altMap: db.altMap() }));
-  });
+    res.type('html').send(renderPage(page, { preview: true, altMap: await db.altMap() }));
+  }));
 
   // ---- auth ----
   app.post('/api/login', (req, res) => {
@@ -100,66 +104,66 @@ function createApp({ seed = true } = {}) {
 
   // ---- pages ----
   const summary = p => ({ id: p.id, slug: p.slug, name: p.name, status: p.status, version: p.version, updatedAt: p.updatedAt, doc: p.doc });
-  const uniqueSlug = base => { let s = base || 'page', i = 2; while (db.getPageBySlug(s) || !validSlug(s)) s = `${base || 'page'}-${i++}`.slice(0, 60); return s; };
+  const uniqueSlug = async base => { let s = base || 'page', i = 2; while (!validSlug(s) || await db.getPageBySlug(s)) s = `${base || 'page'}-${i++}`.slice(0, 60); return s; };
 
-  api.get('/pages', (req, res) => res.json(db.listPages()));
-  api.post('/pages', (req, res) => {
+  api.get('/pages', ah(async (req, res) => res.json(await db.listPages())));
+  api.post('/pages', ah(async (req, res) => {
     const name = str(req.body?.name, 120).trim();
     if (!name) return res.status(400).json({ error: 'Name is required' });
     const doc = req.body?.doc ? normalizeDoc(req.body.doc) : starterDoc(name);
     if (req.body?.doc) doc.theme.brandName = doc.theme.brandName || name;
-    const page = db.createPage({ name, slug: uniqueSlug(slugify(req.body?.slug || name)), doc });
+    const page = await db.createPage({ name, slug: await uniqueSlug(slugify(req.body?.slug || name)), doc });
     res.status(201).json(summary(page));
-  });
-  api.post('/pages/import', (req, res) => {
+  }));
+  api.post('/pages/import', ah(async (req, res) => {
     const src = req.body?.page;
     if (!src || src.format !== 'spotlight-page' || !src.doc) return res.status(400).json({ error: 'Not a Spotlight page export' });
     const name = str(src.name || 'Imported page', 120);
-    res.status(201).json(summary(db.createPage({ name, slug: uniqueSlug(slugify(name)), doc: normalizeDoc(src.doc) })));
-  });
-  api.get('/pages/:id', (req, res) => { const p = db.getPage(req.params.id); p ? res.json(summary(p)) : res.status(404).json({ error: 'Not found' }); });
-  api.put('/pages/:id', (req, res) => {
+    res.status(201).json(summary(await db.createPage({ name, slug: await uniqueSlug(slugify(name)), doc: normalizeDoc(src.doc) })));
+  }));
+  api.get('/pages/:id', ah(async (req, res) => { const p = await db.getPage(req.params.id); p ? res.json(summary(p)) : res.status(404).json({ error: 'Not found' }); }));
+  api.put('/pages/:id', ah(async (req, res) => {
     const { name, slug, status, doc, baseVersion, note } = req.body || {};
     const cleanName = str(name, 120).trim();
     if (!cleanName) return res.status(400).json({ error: 'Name is required' });
     if (!validSlug(slug)) return res.status(400).json({ error: 'URL name must be lowercase letters, numbers and dashes' });
     if (!['draft', 'published'].includes(status)) return res.status(400).json({ error: 'Bad status' });
     try {
-      const r = db.savePage(req.params.id, { name: cleanName, slug, status, doc: normalizeDoc(doc) }, baseVersion, str(note, 100));
+      const r = await db.savePage(req.params.id, { name: cleanName, slug, status, doc: normalizeDoc(doc) }, baseVersion, str(note, 100));
       if (r.missing) return res.status(404).json({ error: 'Not found' });
       if (r.conflict) return res.status(409).json({ error: 'This page was changed somewhere else. Reload to get the latest version.', current: summary(r.current) });
       res.json(summary(r.page));
     } catch (e) {
-      if (/UNIQUE/i.test(e.message)) return res.status(409).json({ error: `The URL name “${slug}” is already used by another page.` });
+      if (e.code === 'UNIQUE' || /UNIQUE/i.test(e.message)) return res.status(409).json({ error: `The URL name “${slug}” is already used by another page.` });
       throw e;
     }
-  });
-  api.delete('/pages/:id', (req, res) => { db.deletePage(req.params.id); res.json({ ok: true }); });
-  api.post('/pages/:id/duplicate', (req, res) => {
-    const src = db.getPage(req.params.id);
+  }));
+  api.delete('/pages/:id', ah(async (req, res) => { await db.deletePage(req.params.id); res.json({ ok: true }); }));
+  api.post('/pages/:id/duplicate', ah(async (req, res) => {
+    const src = await db.getPage(req.params.id);
     if (!src) return res.status(404).json({ error: 'Not found' });
     const name = str(req.body?.name || `${src.name} (copy)`, 120);
     const doc = structuredClone(src.doc);
     doc.theme.brandName = req.body?.name ? str(req.body.name, 80) : doc.theme.brandName;
-    res.status(201).json(summary(db.createPage({ name, slug: uniqueSlug(slugify(req.body?.name || `${src.slug}-copy`)), doc })));
-  });
-  api.get('/pages/:id/export', (req, res) => {
-    const p = db.getPage(req.params.id);
+    res.status(201).json(summary(await db.createPage({ name, slug: await uniqueSlug(slugify(req.body?.name || `${src.slug}-copy`)), doc })));
+  }));
+  api.get('/pages/:id/export', ah(async (req, res) => {
+    const p = await db.getPage(req.params.id);
     if (!p) return res.status(404).json({ error: 'Not found' });
     res.setHeader('Content-Disposition', `attachment; filename="${p.slug}.spotlight.json"`);
-    res.json({ format: 'spotlight-page', version: 1, name: p.name, exportedAt: db.now(), doc: p.doc });
-  });
-  api.get('/pages/:id/revisions', (req, res) => res.json(db.revisions(req.params.id)));
-  api.post('/pages/:id/revisions/:rid/restore', (req, res) => {
-    const page = db.getPage(req.params.id), rev = db.revision(req.params.id, Number(req.params.rid));
+    res.json({ format: 'spotlight-page', version: 1, name: p.name, exportedAt: new Date().toISOString(), doc: p.doc });
+  }));
+  api.get('/pages/:id/revisions', ah(async (req, res) => res.json(await db.revisions(req.params.id))));
+  api.post('/pages/:id/revisions/:rid/restore', ah(async (req, res) => {
+    const page = await db.getPage(req.params.id), rev = await db.revision(req.params.id, Number(req.params.rid));
     if (!page || !rev) return res.status(404).json({ error: 'Not found' });
-    const r = db.savePage(page.id, { name: page.name, slug: page.slug, status: page.status, doc: normalizeDoc(rev.doc) }, null, 'Restored earlier version');
+    const r = await db.savePage(page.id, { name: page.name, slug: page.slug, status: page.status, doc: normalizeDoc(rev.doc) }, null, 'Restored earlier version');
     res.json(summary(r.page));
-  });
+  }));
   api.post('/sections/new', (req, res) => { const s = newSection(req.body?.type); s ? res.json(s) : res.status(400).json({ error: 'Unknown section type' }); });
 
   // ---- media ----
-  api.get('/media', (req, res) => res.json(db.allMedia().map(m => ({ ...m, usedIn: db.mediaUsage(m.url) }))));
+  api.get('/media', ah(async (req, res) => res.json(await Promise.all((await db.allMedia()).map(async m => ({ ...m, usedIn: await db.mediaUsage(m.url) }))))));
   api.post('/media', upload.array('files', 10), async (req, res) => {
     const out = [], errors = [];
     for (const f of req.files || []) {
@@ -170,22 +174,22 @@ function createApp({ seed = true } = {}) {
         if (!type) { errors.push(`${f.originalname}: unsupported file type (use PNG, JPG, GIF, WebP, MP4, MOV or WebM)`); continue; }
         const stored = `${Date.now().toString(36)}-${crypto.randomBytes(5).toString('hex')}.${type.ext}`;
         const saved = await store.save({ path: f.path, name: stored, mime: type.mime, size: f.size });
-        out.push(db.addMedia({ kind: type.kind, name: path.basename(f.originalname).slice(0, 120), mime: type.mime, size: f.size, url: saved.url, storageKey: saved.key }));
+        out.push(await db.addMedia({ kind: type.kind, name: path.basename(f.originalname).slice(0, 120), mime: type.mime, size: f.size, url: saved.url, storageKey: saved.key }));
       } catch (e) {
         errors.push(`${f.originalname}: ${e.message}`);
       } finally { fs.promises.rm(f.path, { force: true }).catch(() => {}); }
     }
     res.status(out.length ? 201 : 400).json({ media: out, errors });
   });
-  api.patch('/media/:id', (req, res) => { if (!db.getMedia(req.params.id)) return res.status(404).json({ error: 'Not found' }); db.setMediaAlt(req.params.id, str(req.body?.alt, 300)); res.json({ ok: true }); });
-  api.delete('/media/:id', async (req, res) => {
-    const m = db.getMedia(req.params.id);
+  api.patch('/media/:id', ah(async (req, res) => { if (!await db.getMedia(req.params.id)) return res.status(404).json({ error: 'Not found' }); await db.setMediaAlt(req.params.id, str(req.body?.alt, 300)); res.json({ ok: true }); }));
+  api.delete('/media/:id', ah(async (req, res) => {
+    const m = await db.getMedia(req.params.id);
     if (!m) return res.status(404).json({ error: 'Not found' });
-    const usedIn = db.mediaUsage(m.url);
+    const usedIn = await db.mediaUsage(m.url);
     if (usedIn.length && req.query.force !== '1') return res.status(409).json({ error: 'In use', usedIn });
     await store.remove(m.storage_key).catch(e => console.error('storage remove failed:', e.message));
-    db.deleteMedia(m.id); res.json({ ok: true });
-  });
+    await db.deleteMedia(m.id); res.json({ ok: true });
+  }));
 
   // ---- errors ----
   app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
@@ -197,9 +201,11 @@ function createApp({ seed = true } = {}) {
   });
   app.use((req, res) => res.status(404).type('html').send(notFound()));
 
-  if (seed && db.count() === 0) {
-    db.createPage({ name: 'Acme Insights (sample)', slug: 'acme-insights', doc: starterDoc('Acme Insights') });
-  }
+  // Resolves once the database is ready (and seeded, if empty). Callers that start listening should await it.
+  app.locals.storage = store.name;
+  app.locals.ready = db.ready.then(async () => {
+    if (seed && await db.count() === 0) await db.createPage({ name: 'Acme Insights (sample)', slug: 'acme-insights', doc: starterDoc('Acme Insights') });
+  });
   return app;
 }
 
@@ -207,9 +213,10 @@ const notFound = () => `<!doctype html><meta charset=utf-8><title>Not found</tit
 
 if (require.main === module) {
   const app = createApp();
-  app.listen(config.port, () => {
-    console.log(`Spotlight running on http://localhost:${config.port}  (admin: /admin, storage: ${config.supabase.url ? 'supabase' : 'local disk'})`);
+  app.locals.ready.then(() => app.listen(config.port, () => {
+    console.log(`Spotlight running on http://localhost:${config.port}  (admin: /admin, database: ${db.kind}, media: ${config.supabase.url ? 'supabase' : 'local disk'})`);
+    if (db.kind === 'postgres' && app.locals.storage === 'local') console.warn('Note: pages are in Postgres but uploads are on local disk. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY so media is stored off-box too.');
     if (config.generatedPassword) console.log(`ADMIN_PASSWORD not set. Temporary admin password for this run: ${config.adminPassword}`);
-  });
+  })).catch(e => { console.error(`Could not start: ${e.message}`); process.exit(1); });
 }
-module.exports = { createApp, sniff };
+module.exports = { createApp, sniff, db };

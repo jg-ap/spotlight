@@ -6,7 +6,7 @@ product, then tweak it.
 
 * **Public pages** `/p/<slug>`, an index of published pages at `/`
 * **Admin (Spotlight Studio)** `/admin`
-* No build step: Node 22+, Express, SQLite (`node:sqlite`), vanilla JS.
+* No build step: Node 22+, Express, vanilla JS. Content in **Postgres (Supabase)** or, for local use, a SQLite file.
 
 ## Run it
 
@@ -14,7 +14,8 @@ product, then tweak it.
 npm install
 cp .env.example .env      # set ADMIN_PASSWORD
 npm start                 # http://localhost:3000/admin
-npm test                  # API, security and storage tests
+npm test                  # API, security and storage tests (SQLite)
+TEST_DATABASE_URL=postgresql://… npm run test:pg   # same suite against Postgres (resets its `spotlight` schema!)
 ```
 
 If `ADMIN_PASSWORD` is unset in development, a temporary one is printed at startup. In production
@@ -32,9 +33,22 @@ If `ADMIN_PASSWORD` is unset in development, a temporary one is printed at start
 | **Safety net** | Autosave, version history with restore, warning if the page was changed in another tab |
 | **Preview** | Live desktop / tablet / mobile preview beside the editor. Click a section in the preview to jump to its form |
 
-## Media storage (Supabase)
+## Supabase
 
-Uploads go to **Supabase Storage** when these are set, otherwise to local disk (`DATA_DIR/uploads`):
+Set these three groups and nothing needs to live on the app server's disk.
+
+**Page content (Postgres)**
+
+```
+DATABASE_URL=postgresql://postgres.<ref>:<password>@<host>:5432/postgres
+```
+
+Copy the URI from *Project Settings > Database > Connection string*. Use the *Session pooler* string if your host
+has no IPv6. Tables are created automatically on first start, in their own `spotlight` schema, with Row Level
+Security on and no policies, so Supabase's public API and anon key cannot read or change them. The connection is
+encrypted; to also verify the server certificate, download Supabase's CA certificate and set `DATABASE_CA` to its path.
+
+**Media (Storage)**
 
 ```
 SUPABASE_URL=https://<project>.supabase.co
@@ -42,16 +56,18 @@ SUPABASE_SERVICE_ROLE_KEY=<service role key>
 SUPABASE_BUCKET=spotlight-media
 ```
 
-The bucket is created automatically as **public-read** (the pages need to load the files). The service-role key
-stays on the server and is never sent to the browser. Mind your Supabase plan's per-object size cap
-(50 MB on the free tier); set `MAX_UPLOAD_MB` to match.
+The bucket is created automatically as **public-read** (the pages need to load the files). The service-role key stays
+on the server and is never sent to the browser. Mind your plan's per-object size cap (50 MB on the free tier) and
+set `MAX_UPLOAD_MB` to match.
+
+Without `DATABASE_URL` the app uses SQLite at `DATA_DIR/spotlight.db`, and without the Supabase storage variables it
+saves uploads to `DATA_DIR/uploads`. Both are fine locally; on a host with an ephemeral disk they would be lost on redeploy.
 
 ## Deploying
 
-* Page content lives in SQLite at `DATA_DIR/spotlight.db`. Put `DATA_DIR` on a **persistent volume**; on
-  hosts with ephemeral disks the content would be lost on redeploy.
-* Put it behind HTTPS (and your SSO / VPN if pages are internal-only). The admin cookie is `Secure` in production.
-* Public pages are not authenticated by the app itself. Restrict network access if they must not be public.
+* Put it behind HTTPS. The admin cookie is `Secure` in production.
+* Public pages are not authenticated by the app itself. If they must stay internal, restrict access at the network layer.
+* Set `NODE_ENV=production` and `ADMIN_PASSWORD`.
 
 ## Security notes
 

@@ -1,5 +1,8 @@
 // Progressive enhancement for public pages: tabs, carousel, active nav link.
 (() => {
+  // Respect "reduce motion": autoplaying videos start paused (viewers can press play).
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) document.querySelectorAll('video[autoplay]').forEach(v => { v.removeAttribute('autoplay'); v.pause(); v.loop = false; });
+
   document.querySelectorAll('[data-tabs]').forEach(root => {
     const tabs = [...root.querySelectorAll('[role=tab]')];
     const panels = [...root.querySelectorAll('[role=tabpanel]')];

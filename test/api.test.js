@@ -10,8 +10,8 @@ process.env.DATA_DIR = tmp;
 process.env.ADMIN_PASSWORD = 'correct horse battery';
 process.env.SUPABASE_URL = '';
 
-const { createApp } = require('../server');
-let server, base, cookie;
+const PG = !!process.env.DATABASE_URL; // run `npm run test:pg` to exercise the Postgres backend
+let createApp, db, server, base, cookie;
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
 
 const call = (p, { method = 'GET', body, headers = {}, raw } = {}) => fetch(base + p, {
@@ -22,11 +22,23 @@ const call = (p, { method = 'GET', body, headers = {}, raw } = {}) => fetch(base
 const json = async r => r.json();
 
 before(async () => {
-  server = createApp({ seed: false }).listen(0);
+  if (PG) { // start from an empty schema
+    const { Client } = require('pg');
+    const c = new Client({ connectionString: process.env.DATABASE_URL }); await c.connect();
+    await c.query('DROP SCHEMA IF EXISTS spotlight CASCADE'); await c.end();
+  }
+  ({ createApp, db } = require('../server'));
+  const app = createApp({ seed: false });
+  await app.locals.ready;
+  server = app.listen(0);
   await new Promise(r => server.once('listening', r));
   base = `http://127.0.0.1:${server.address().port}`;
 });
-after(() => { server.close(); fs.rmSync(tmp, { recursive: true, force: true }); });
+after(async () => { server.close(); await db.close(); fs.rmSync(tmp, { recursive: true, force: true }); });
+
+test(`backend is ${PG ? 'postgres' : 'sqlite'}`, async () => {
+  assert.equal((await (await fetch(base + '/healthz')).json()).database, PG ? 'postgres' : 'sqlite');
+});
 
 test('auth: gate, wrong password, login, header requirement', async () => {
   assert.equal((await call('/api/pages')).status, 401);
@@ -201,4 +213,44 @@ test('a gallery with no media is left off the live page but shown in preview', a
   assert.ok(!live.includes('Gallery heading'), 'empty gallery hidden from the public');
   const pv = await (await call(`/preview/${page.id}`)).text();
   assert.ok(pv.includes('Gallery heading'), 'still visible in the editor preview');
+});
+
+test('concurrent saves with the same base version: exactly one wins', async () => {
+  const p = await json(await call('/api/pages', { method: 'POST', body: { name: 'Race' } }));
+  const put = n => call(`/api/pages/${p.id}`, { method: 'PUT', body: { ...p, name: `Race ${n}`, baseVersion: p.version } });
+  const codes = (await Promise.all([put(1), put(2), put(3)])).map(r => r.status).sort();
+  assert.deepEqual(codes, [200, 409, 409]);
+});
+
+test('pages can be read straight back out of the database', async () => {
+  const list = await json(await call('/api/pages'));
+  assert.ok(list.length >= 2);
+  const first = await db.getPage(list[0].id);
+  assert.ok(first.doc.sections && first.version >= 1);
+});
+
+test('index page lists published pages with their description', async () => {
+  const p = await json(await call('/api/pages', { method: 'POST', body: { name: 'Listed Page' } }));
+  const doc = structuredClone(p.doc); doc.meta.description = 'Shown on the index card';
+  await call(`/api/pages/${p.id}`, { method: 'PUT', body: { ...p, status: 'published', doc, baseVersion: p.version } });
+  const html = await (await fetch(base + '/')).text();
+  assert.match(html, /Listed Page/);
+  assert.match(html, /Shown on the index card/);
+});
+
+test('postgres: private schema, RLS on, anon has no access, migration is idempotent and race-safe', { skip: !PG }, async () => {
+  const { Client } = require('pg');
+  const c = new Client({ connectionString: process.env.DATABASE_URL }); await c.connect();
+  try {
+    const rls = (await c.query(`SELECT relname, relrowsecurity FROM pg_class WHERE relnamespace = 'spotlight'::regnamespace AND relkind = 'r' ORDER BY 1`)).rows;
+    assert.deepEqual(rls.map(r => r.relname), ['media', 'pages', 'revisions']);
+    assert.ok(rls.every(r => r.relrowsecurity), 'row level security is enabled on every table');
+    await c.query(`DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='anon') THEN CREATE ROLE anon NOLOGIN; END IF; END $$`);
+    const mk = require('../lib/db/postgres');
+    await Promise.all([mk(process.env.DATABASE_URL), mk(process.env.DATABASE_URL), mk(process.env.DATABASE_URL)].map(async d => { await d.ready; await d.close(); }));
+    const priv = (await c.query(`SELECT has_schema_privilege('anon','spotlight','USAGE') AS usage, has_table_privilege('anon','spotlight.pages','SELECT') AS sel`)).rows[0];
+    assert.equal(priv.usage, false); assert.equal(priv.sel, false);
+    const exposed = (await c.query(`SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema='public' AND table_name IN ('pages','revisions','media')`)).rows[0].n;
+    assert.equal(exposed, 0, 'nothing is created in the public schema that Supabase exposes');
+  } finally { await c.end(); }
 });
